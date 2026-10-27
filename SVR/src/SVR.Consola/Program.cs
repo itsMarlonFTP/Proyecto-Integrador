@@ -420,7 +420,12 @@ foreach (var grupo in ventasConPromocion.GroupBy(
         continue;
     }
 
-    decimal montoTotal = grupo.Sum(registro => registro.Total);
+    decimal subtotalTicket = grupo.Sum(registro => registro.Total);
+    decimal ivaTicket = Math.Round(
+    subtotalTicket * 0.16m,
+    2,
+    MidpointRounding.AwayFromZero);
+    decimal montoTotal = subtotalTicket + ivaTicket;
 
     // Se crea el tipo de pago del dominio a partir del medio declarado en el CSV.
     Pago? pago = medios[0] switch
@@ -689,5 +694,210 @@ static async Task<(string Ean, int? Existencia, string? Error)>
 
 
 Pendiente("HU-08 Pedido sugerido, top de ventas y corte de caja en CSV");
+
+// HU-08: prepara resúmenes usando solo ventas que pasaron pago, horario y stock.
+const decimal tasaIva = 0.16m;
+
+// Se calcula un registro por ticket para que el corte no duplique folios con varias líneas.
+var corteTickets = ventasConStockDescontado
+    .GroupBy(registro => registro.Venta.Folio, StringComparer.Ordinal)
+    .Select(grupo =>
+    {
+        decimal bruto = grupo.Sum(registro => registro.Bruto);
+        decimal descuento = grupo.Sum(registro => registro.Descuento);
+        decimal subtotal = bruto - descuento;
+        decimal iva = Math.Round(
+            subtotal * tasaIva,
+            2,
+            MidpointRounding.AwayFromZero);
+
+        return new
+        {
+            Folio = grupo.Key,
+            MedioPago = grupo.First().Venta.MedioPago.ToUpperInvariant(),
+            Bruto = bruto,
+            Descuento = descuento,
+            Subtotal = subtotal,
+            Iva = iva,
+            Total = subtotal + iva
+        };
+    })
+    .OrderBy(ticket => ticket.Folio)
+    .ToList();
+
+// Top 3 por piezas vendidas; se calcula sobre líneas efectivamente descontadas del inventario.
+var topVentas = ventasConStockDescontado
+    .GroupBy(registro => registro.Venta.Ean, StringComparer.Ordinal)
+    .Select(grupo =>
+    {
+        Producto producto = productosPorEan[grupo.Key];
+
+        return new
+        {
+            Ean = grupo.Key,
+            Descripcion = producto.Descripcion,
+            Piezas = grupo.Sum(registro => registro.Venta.Piezas),
+            ImporteNeto = grupo.Sum(registro => registro.Total)
+        };
+    })
+    .OrderByDescending(producto => producto.Piezas)
+    .ThenBy(producto => producto.Descripcion, StringComparer.Ordinal)
+    .Take(3)
+    .ToList();
+
+// Solo se propone reabastecer productos por debajo de su punto de reorden.
+// La cantidad propuesta se limita a lo que el CEDIS reportó disponible.
+var pedidoSugerido = productos
+    .Select(producto =>
+    {
+        int faltante = Math.Max(0, producto.PuntoReorden - producto.Stock);
+        bool cedisConsultado = existenciasCedis.TryGetValue(
+            producto.Ean,
+            out int existenciaCedis);
+
+        int piezasSugeridas = cedisConsultado
+            ? Math.Min(faltante, existenciaCedis)
+            : 0;
+
+        string estado = faltante == 0
+            ? "SIN_REORDEN"
+            : !cedisConsultado
+                ? "CEDIS_NO_DISPONIBLE"
+                : existenciaCedis == 0
+                    ? "CEDIS_SIN_EXISTENCIA"
+                    : "SUGERIDO";
+
+        return new
+        {
+            Producto = producto,
+            Faltante = faltante,
+            ExistenciaCedis = cedisConsultado ? existenciaCedis.ToString(
+                CultureInfo.InvariantCulture) : "NO_DISPONIBLE",
+            PiezasSugeridas = piezasSugeridas,
+            Estado = estado
+        };
+    })
+    .Where(item => item.Faltante > 0)
+    .OrderBy(item => item.Producto.Ean)
+    .ToList();
+
+// Los archivos se guardan junto a los datos de entrada.
+string rutaPedido = Path.Combine(datos, "pedido_0457.csv");
+string rutaTopVentas = Path.Combine(datos, "top_ventas_0457.csv");
+string rutaCorteCaja = Path.Combine(datos, "corte_caja_0457.csv");
+
+// Exporta el pedido; se incluyen productos bajo reorden aunque el CEDIS no esté disponible.
+CorteCajaExportador.EscribirCsv(
+    rutaPedido,
+    new[]
+    {
+        new[]
+        {
+            "ean", "descripcion", "stock_tienda", "punto_reorden",
+            "existencia_cedis", "piezas_sugeridas", "estado"
+        }
+    }.Concat(pedidoSugerido.Select(item => new[]
+    {
+        item.Producto.Ean,
+        item.Producto.Descripcion,
+        item.Producto.Stock.ToString(CultureInfo.InvariantCulture),
+        item.Producto.PuntoReorden.ToString(CultureInfo.InvariantCulture),
+        item.ExistenciaCedis,
+        item.PiezasSugeridas.ToString(CultureInfo.InvariantCulture),
+        item.Estado
+    })));
+
+// Exporta los tres productos con más piezas vendidas.
+CorteCajaExportador.EscribirCsv(
+    rutaTopVentas,
+    new[]
+    {
+        new[] { "ean", "descripcion", "piezas_vendidas", "importe_neto" }
+    }.Concat(topVentas.Select(item => new[]
+    {
+        item.Ean,
+        item.Descripcion,
+        item.Piezas.ToString(CultureInfo.InvariantCulture),
+        item.ImporteNeto.ToString("F2", CultureInfo.InvariantCulture)
+    })));
+
+// El corte incluye detalle por ticket, resumen por medio de pago y total general.
+var filasCorte = new List<string[]>
+{
+    new[]
+    {
+        "tipo", "folio", "medio_pago", "bruto", "descuento",
+        "subtotal", "iva", "total"
+    }
+};
+
+foreach (var ticket in corteTickets)
+{
+    filasCorte.Add(new[]
+    {
+        "TICKET",
+        ticket.Folio,
+        ticket.MedioPago,
+        ticket.Bruto.ToString("F2", CultureInfo.InvariantCulture),
+        ticket.Descuento.ToString("F2", CultureInfo.InvariantCulture),
+        ticket.Subtotal.ToString("F2", CultureInfo.InvariantCulture),
+        ticket.Iva.ToString("F2", CultureInfo.InvariantCulture),
+        ticket.Total.ToString("F2", CultureInfo.InvariantCulture)
+    });
+}
+
+// Los pagos se suman por ticket, así no se duplica el importe en tickets con varias líneas.
+foreach (var grupoPago in corteTickets.GroupBy(
+             ticket => ticket.MedioPago,
+             StringComparer.Ordinal))
+{
+    filasCorte.Add(new[]
+    {
+        "PAGO",
+        "",
+        grupoPago.Key,
+        "",
+        "",
+        "",
+        "",
+        grupoPago.Sum(ticket => ticket.Total)
+            .ToString("F2", CultureInfo.InvariantCulture)
+    });
+}
+
+decimal brutoGeneral = corteTickets.Sum(ticket => ticket.Bruto);
+decimal descuentoGeneral = corteTickets.Sum(ticket => ticket.Descuento);
+decimal subtotalGeneral = corteTickets.Sum(ticket => ticket.Subtotal);
+decimal ivaGeneral = corteTickets.Sum(ticket => ticket.Iva);
+decimal totalGeneral = corteTickets.Sum(ticket => ticket.Total);
+
+filasCorte.Add(new[]
+{
+    "CIERRE",
+    "",
+    "",
+    brutoGeneral.ToString("F2", CultureInfo.InvariantCulture),
+    descuentoGeneral.ToString("F2", CultureInfo.InvariantCulture),
+    subtotalGeneral.ToString("F2", CultureInfo.InvariantCulture),
+    ivaGeneral.ToString("F2", CultureInfo.InvariantCulture),
+    totalGeneral.ToString("F2", CultureInfo.InvariantCulture)
+});
+
+CorteCajaExportador.EscribirCsv(rutaCorteCaja, filasCorte);
+
+Console.WriteLine("=== HU-08 · RESUMEN DEL CIERRE ===");
+Console.WriteLine($"Tickets incluidos: {corteTickets.Count}");
+Console.WriteLine($"Bruto: {brutoGeneral:C2}");
+Console.WriteLine($"Descuentos: {descuentoGeneral:C2}");
+Console.WriteLine($"Subtotal: {subtotalGeneral:C2}");
+Console.WriteLine($"IVA: {ivaGeneral:C2}");
+Console.WriteLine($"Total: {totalGeneral:C2}");
+Console.WriteLine($"Pedido sugerido: {pedidoSugerido.Count} productos, " +
+                  $"{pedidoSugerido.Sum(item => item.PiezasSugeridas)} piezas.");
+Console.WriteLine($"Archivos generados:");
+Console.WriteLine($"- {rutaPedido}");
+Console.WriteLine($"- {rutaTopVentas}");
+Console.WriteLine($"- {rutaCorteCaja}");
+Console.WriteLine();
 
 static void Pendiente(string historia) => Console.WriteLine($"[pendiente] {historia}");

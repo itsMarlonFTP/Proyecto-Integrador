@@ -60,15 +60,51 @@ public sealed class Producto
         Precio = precio;
         PuntoReorden = puntoReorden;
         Stock = stock;
+
+        
+        
     }
+
+    public void ValidarDisponibilidad(int piezas)
+{
+    if (piezas <= 0)
+    {
+        throw new ArgumentOutOfRangeException(
+            nameof(piezas),
+            "La cantidad debe ser mayor que cero.");
+    }
+
+    if (Stock < piezas)
+    {
+        throw new StockInsuficienteException(Ean, Stock, piezas);
+    }
+}
+
+/// <summary>
+/// Descuenta existencias después de verificar que sean suficientes.
+/// </summary>
+/// <param name="piezas">Unidades que se venden.</param>
+public void DescontarStock(int piezas)
+{
+    // Se comprueba antes de modificar para no dejar el inventario negativo.
+    ValidarDisponibilidad(piezas);
+    Stock -= piezas;
+}
+
+
+
+
+    public bool EsAlcoholico =>
+        string.Equals(Categoria, "Alcohol", StringComparison.OrdinalIgnoreCase);
 
     public string Ean { get; }
     public string Descripcion { get; }
     public string Categoria { get; }
     public decimal Precio { get; }
     public int PuntoReorden { get; }
-    public int Stock { get; }
+    public int Stock { get; private set;}
 }
+
 
 
 // HU-02 · TODO: LineaVenta (record)
@@ -82,13 +118,105 @@ public sealed record LineaVenta(
     string MedioPago
 );
 
-
-
-
-
 // HU-01 a HU-06 · TODO: excepciones de dominio
 //   TiendaException (abstract) -> ProductoNoEncontradoException, StockInsuficienteException,
 //   VentaRestringidaException. Con propiedades de contexto (Ean, Disponible...). Módulo 5.
+
+/// <summary>
+/// Excepción base para errores de negocio de la tienda.
+/// </summary>
+public abstract class TiendaException : Exception
+{
+    /// <summary>
+    /// Crea una excepción de negocio con un mensaje descriptivo.
+    /// </summary>
+    /// <param name="mensaje">Descripción del error.</param>
+    protected TiendaException(string mensaje) : base(mensaje)
+    {
+    }
+}
+
+/// <summary>
+/// Indica que el EAN solicitado no existe en el catálogo.
+/// </summary>
+public sealed class ProductoNoEncontradoException : TiendaException
+{
+    /// <summary>
+    /// Crea la excepción para el EAN no encontrado.
+    /// </summary>
+    /// <param name="ean">EAN buscado.</param>
+    public ProductoNoEncontradoException(string ean)
+        : base($"El producto '{ean}' no existe en el catálogo.")
+    {
+        Ean = ean;
+    }
+
+    /// <summary>
+    /// Obtiene el EAN que no se encontró.
+    /// </summary>
+    public string Ean { get; }
+}
+
+/// <summary>
+/// Indica que la cantidad solicitada supera el stock disponible.
+/// </summary>
+public sealed class StockInsuficienteException : TiendaException
+{
+    /// <summary>
+    /// Crea la excepción con el detalle de existencias y cantidad solicitada.
+    /// </summary>
+    public StockInsuficienteException(string ean, int disponible, int solicitado)
+        : base($"Stock insuficiente de '{ean}': hay {disponible}, se solicitaron {solicitado}.")
+    {
+        Ean = ean;
+        Disponible = disponible;
+        Solicitado = solicitado;
+    }
+
+    /// <summary>
+    /// Obtiene el EAN del producto afectado.
+    /// </summary>
+    public string Ean { get; }
+
+    /// <summary>
+    /// Obtiene las piezas disponibles.
+    /// </summary>
+    public int Disponible { get; }
+
+    /// <summary>
+    /// Obtiene las piezas solicitadas.
+    /// </summary>
+    public int Solicitado { get; }
+}
+
+/// <summary>
+/// Indica que una venta se bloqueó por una restricción comercial.
+/// </summary>
+public sealed class VentaRestringidaException : TiendaException
+{
+    /// <summary>
+    /// Crea la excepción para la venta restringida del producto y la hora indicados.
+    /// </summary>
+    public VentaRestringidaException(string ean, TimeOnly hora)
+        : base($"No se permite vender el producto '{ean}' a las {hora:HH:mm}.")
+    {
+        Ean = ean;
+        Hora = hora;
+    }
+
+    /// <summary>
+    /// Obtiene el EAN del producto restringido.
+    /// </summary>
+    public string Ean { get; }
+
+    /// <summary>
+    /// Obtiene la hora de la venta restringida.
+    /// </summary>
+    public TimeOnly Hora { get; }
+}
+
+
+
 
 // HU-03 · TODO: Promocion (abstract) con Descuento(precio, piezas)
 //   -> LlevaNPagaM (NXM 2;1), PorcentajeDesc (PORCENTAJE 15), PrecioPorVolumen (VOLUMEN 6;18.00).
@@ -355,3 +483,103 @@ public sealed class PrecioPorVolumen : Promocion
 
 // HU-04 · TODO: Pago (abstract record) -> Efectivo, Tarjeta, Vales
 //   Valida cada pago con switch expression y property patterns. Módulo 7.
+/// <summary>
+/// Representa el importe que se intenta cubrir con un medio de pago.
+/// </summary>
+public abstract record Pago
+{
+    /// <summary>
+    /// Crea un pago para un importe positivo.
+    /// </summary>
+    /// <param name="monto">Importe del pago.</param>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// El importe no es mayor que cero.
+    /// </exception>
+    protected Pago(decimal monto)
+    {
+        if (monto <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(monto),
+                "El monto del pago debe ser mayor que cero.");
+        }
+
+        Monto = monto;
+    }
+
+    /// <summary>
+    /// Obtiene el importe asociado al pago.
+    /// </summary>
+    public decimal Monto { get; }
+
+    /// <summary>
+    /// Valida las reglas propias del tipo de pago.
+    /// </summary>
+    /// <returns>Resultado de la validación y su motivo.</returns>
+    public abstract ResultadoValidacionPago Validar();
+}
+
+/// <summary>
+/// Representa un pago en efectivo.
+/// </summary>
+public sealed record Efectivo : Pago
+{
+    /// <summary>
+    /// Crea un pago en efectivo por el importe indicado.
+    /// </summary>
+    public Efectivo(decimal monto) : base(monto)
+    {
+    }
+
+    /// <inheritdoc />
+    public override ResultadoValidacionPago Validar() =>
+        new(true, "Medio efectivo reconocido; importe registrado.");
+}
+
+/// <summary>
+/// Representa un pago con tarjeta.
+/// </summary>
+public sealed record Tarjeta : Pago
+{
+    /// <summary>
+    /// Crea un pago con tarjeta por el importe indicado.
+    /// </summary>
+    public Tarjeta(decimal monto) : base(monto)
+    {
+    }
+
+    /// <inheritdoc />
+    public override ResultadoValidacionPago Validar() =>
+        new(true, "Medio tarjeta reconocido; autorización bancaria no disponible en el CSV.");
+}
+
+/// <summary>
+/// Representa un pago con vales.
+/// </summary>
+public sealed record Vales : Pago
+{
+    /// <summary>
+    /// Importe máximo permitido para pagar con vales.
+    /// </summary>
+    public const decimal LimiteMonto = 1000m;
+
+    /// <summary>
+    /// Crea un pago con vales por el importe indicado.
+    /// </summary>
+    public Vales(decimal monto) : base(monto)
+    {
+    }
+
+    /// <inheritdoc />
+    public override ResultadoValidacionPago Validar() =>
+        Monto <= LimiteMonto
+            ? new(true, "Pago con vales dentro del límite permitido.")
+            : new(false, $"El monto excede el límite de vales de {LimiteMonto:C2}.");
+}
+
+/// <summary>
+/// Resultado de validar un pago.
+/// </summary>
+/// <param name="Aceptado">Indica si el pago cumple las reglas disponibles.</param>
+/// <param name="Mensaje">Explicación del resultado.</param>
+public sealed record ResultadoValidacionPago(bool Aceptado, string Mensaje);

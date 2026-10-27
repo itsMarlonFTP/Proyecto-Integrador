@@ -394,11 +394,300 @@ Console.WriteLine();
 
 
 Pendiente("HU-04 Validar el pago según su medio: efectivo, tarjeta o vales");
+
+// HU-04: valida el medio de pago contra el importe total de cada ticket.
+var pagosValidos = new List<(string Folio, Pago Pago)>();
+var foliosConPagoValido = new HashSet<string>(StringComparer.Ordinal);
+var rechazosPagos = new List<string>();
+
+// El CSV puede tener varias líneas por ticket, así que el pago se valida
+// sobre el total promocional del folio, no individualmente por cada producto.
+foreach (var grupo in ventasConPromocion.GroupBy(
+             registro => registro.Venta.Folio,
+             StringComparer.Ordinal))
+{
+    string folio = grupo.Key;
+    string[] medios = grupo
+        .Select(registro => registro.Venta.MedioPago.Trim().ToUpperInvariant())
+        .Distinct(StringComparer.Ordinal)
+        .ToArray();
+
+    // Todas las líneas de un mismo ticket deben indicar el mismo medio de pago.
+    if (medios.Length != 1)
+    {
+        rechazosPagos.Add(
+            $"Ticket {folio}: las líneas tienen medios de pago diferentes.");
+        continue;
+    }
+
+    decimal montoTotal = grupo.Sum(registro => registro.Total);
+
+    // Se crea el tipo de pago del dominio a partir del medio declarado en el CSV.
+    Pago? pago = medios[0] switch
+    {
+        "EFECTIVO" => new Efectivo(montoTotal),
+        "TARJETA" => new Tarjeta(montoTotal),
+        "VALES" => new Vales(montoTotal),
+        _ => null
+    };
+
+    if (pago is null)
+    {
+        rechazosPagos.Add(
+            $"Ticket {folio}: medio de pago '{medios[0]}' no soportado.");
+        continue;
+    }
+
+    ResultadoValidacionPago resultado = pago.Validar();
+
+    if (!resultado.Aceptado)
+    {
+        rechazosPagos.Add($"Ticket {folio}: {resultado.Mensaje}");
+        continue;
+    }
+
+    pagosValidos.Add((folio, pago));
+    foliosConPagoValido.Add(folio);
+
+    Console.WriteLine(
+        $"Pago {folio}: {medios[0]} por {pago.Monto:C2} — {resultado.Mensaje}");
+}
+
+// Se agregan los rechazos de pago al log creado por HU-02, sin borrar sus registros.
+if (rechazosPagos.Count > 0)
+{
+    File.AppendAllLines(rutaRechazos, rechazosPagos);
+}
+
+Console.WriteLine($"Tickets con pago válido: {pagosValidos.Count}");
+Console.WriteLine($"Tickets con pago rechazado: {rechazosPagos.Count}");
+
+foreach (string rechazo in rechazosPagos)
+{
+    Console.WriteLine(rechazo);
+}
+
+Console.WriteLine();
+
 Pendiente("HU-05 No vender alcohol fuera de horario ni productos bloqueados");
+
+// HU-05: rechaza el ticket completo si contiene alcohol vendido después de las 23:00.
+// HU-05: bloquea tickets que incluyan alcohol vendido después de las 23:00.
+TimeOnly horaLimiteAlcohol = new(23, 0);
+var foliosRestringidos = new HashSet<string>(StringComparer.Ordinal);
+var rechazosRestricciones = new List<string>();
+
+foreach (var registro in ventasConPromocion)
+{
+    LineaVenta venta = registro.Venta;
+    Producto producto = productosPorEan[venta.Ean];
+
+    // La categoría proviene del catálogo; se compara ignorando mayúsculas y espacios.
+    bool esAlcohol = string.Equals(
+        producto.Categoria.Trim(),
+        "Alcohol",
+        StringComparison.OrdinalIgnoreCase);
+
+    if (esAlcohol && venta.Hora > horaLimiteAlcohol)
+    {
+        // Se excluye el ticket completo, aunque tenga otras líneas no alcohólicas.
+        foliosRestringidos.Add(venta.Folio);
+
+        string motivo =
+            $"Ticket {venta.Folio}, EAN {venta.Ean}: " +
+            $"venta de alcohol restringida a las {venta.Hora:HH:mm}.";
+
+        rechazosRestricciones.Add(motivo);
+    }
+}
+
+// Solo pasan tickets con pago válido y sin restricción comercial.
+var ventasPermitidas = ventasConPromocion
+    .Where(registro =>
+        foliosConPagoValido.Contains(registro.Venta.Folio) &&
+        !foliosRestringidos.Contains(registro.Venta.Folio))
+    .ToList();
+
+// Se agregan los rechazos al log existente de HU-02.
+if (rechazosRestricciones.Count > 0)
+{
+    File.AppendAllLines(rutaRechazos, rechazosRestricciones);
+}
+
+Console.WriteLine($"Tickets restringidos: {foliosRestringidos.Count}");
+Console.WriteLine($"Líneas permitidas para HU-06: {ventasPermitidas.Count}");
+
+foreach (string rechazo in rechazosRestricciones)
+{
+    Console.WriteLine(rechazo);
+}
+
+Console.WriteLine();
+
+
 Pendiente("HU-06 Descontar inventario y avisar si no hay stock suficiente");
+
+
+// HU-06: valida existencias por ticket y descuenta solo si todas sus líneas caben en stock.
+var ventasConStockDescontado =
+    new List<(LineaVenta Venta, decimal Bruto, decimal Descuento,
+              decimal Total, string? PromocionAplicada)>();
+
+var rechazosStock = new List<string>();
+
+foreach (var grupoTicket in ventasPermitidas.GroupBy(
+             registro => registro.Venta.Folio,
+             StringComparer.Ordinal))
+{
+    // Se suman líneas del mismo producto dentro del ticket para validar el total requerido.
+    var piezasPorEan = grupoTicket
+        .GroupBy(
+            registro => registro.Venta.Ean,
+            StringComparer.Ordinal)
+        .Select(grupoEan => new
+        {
+            Ean = grupoEan.Key,
+            Piezas = grupoEan.Sum(registro => registro.Venta.Piezas)
+        })
+        .ToList();
+
+    var erroresStock = new List<string>();
+
+    // Primero se valida todo el ticket; así no se descuenta parcialmente si una línea falla.
+    foreach (var solicitud in piezasPorEan)
+    {
+        Producto producto = productosPorEan[solicitud.Ean];
+
+        try
+        {
+            producto.ValidarDisponibilidad(solicitud.Piezas);
+        }
+        catch (StockInsuficienteException excepcion)
+        {
+            erroresStock.Add(excepcion.Message);
+        }
+    }
+
+    if (erroresStock.Count > 0)
+    {
+        string motivo =
+            $"Ticket {grupoTicket.Key}: {string.Join("; ", erroresStock)}";
+
+        rechazosStock.Add(motivo);
+        Console.WriteLine($"RECHAZADO — {motivo}");
+        continue;
+    }
+
+    // Solo se actualiza el inventario cuando todas las líneas del ticket son viables.
+    foreach (var solicitud in piezasPorEan)
+    {
+        productosPorEan[solicitud.Ean].DescontarStock(solicitud.Piezas);
+    }
+
+    ventasConStockDescontado.AddRange(grupoTicket);
+
+    Console.WriteLine(
+        $"Ticket {grupoTicket.Key}: inventario descontado correctamente.");
+}
+
+// Se agregan los rechazos de stock al mismo log de las historias anteriores.
+if (rechazosStock.Count > 0)
+{
+    File.AppendAllLines(rutaRechazos, rechazosStock);
+}
+
+Console.WriteLine($"Tickets con inventario descontado: {ventasConStockDescontado.Select(x => x.Venta.Folio).Distinct(StringComparer.Ordinal).Count()}");
+Console.WriteLine($"Tickets rechazados por stock: {rechazosStock.Count}");
+
+Console.WriteLine("Existencias finales:");
+foreach (Producto producto in productos)
+{
+    Console.WriteLine($"{producto.Ean} | {producto.Descripcion} | Stock: {producto.Stock}");
+}
+
+Console.WriteLine();
+
 
 // Avance 3 (11:15–12:15)
 Pendiente("HU-07 Consultar existencias del CEDIS en paralelo con timeout de 3 s");
+
+// HU-07: consulta las existencias del CEDIS en paralelo con un límite de 3 segundos.
+using var ctsCedis = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+var cronometroCedis = System.Diagnostics.Stopwatch.StartNew();
+
+// Se consulta una vez por cada EAN distinto; las tareas comienzan antes de esperar.
+string[] eansCedis = productos
+    .Select(producto => producto.Ean)
+    .Distinct(StringComparer.Ordinal)
+    .ToArray();
+
+Task<(string Ean, int? Existencia, string? Error)>[] tareasCedis = eansCedis
+    .Select(ean => ConsultarCedisSeguroAsync(ean, cedis, ctsCedis.Token))
+    .ToArray();
+
+// Todas las consultas se esperan juntas; el token cancela las que excedan 3 segundos.
+var resultadosCedis = await Task.WhenAll(tareasCedis);
+
+cronometroCedis.Stop();
+
+// Este diccionario queda disponible para HU-08.
+var existenciasCedis = resultadosCedis
+    .Where(resultado => resultado.Existencia.HasValue)
+    .ToDictionary(
+        resultado => resultado.Ean,
+        resultado => resultado.Existencia!.Value,
+        StringComparer.Ordinal);
+
+foreach (var resultado in resultadosCedis)
+{
+    if (resultado.Existencia.HasValue)
+    {
+        Console.WriteLine(
+            $"CEDIS {resultado.Ean}: {resultado.Existencia.Value} piezas.");
+    }
+    else
+    {
+        Console.WriteLine(
+            $"CEDIS {resultado.Ean}: consulta cancelada o fallida — {resultado.Error}");
+    }
+}
+
+Console.WriteLine(
+    $"Consultas CEDIS: {existenciasCedis.Count} exitosas de {eansCedis.Length} " +
+    $"en {cronometroCedis.ElapsedMilliseconds} ms (timeout: 3000 ms).");
+Console.WriteLine();
+
+/// <summary>
+/// Consulta un EAN al CEDIS y devuelve el error como dato para no interrumpir el cierre.
+/// </summary>
+/// <param name="ean">EAN que se consulta.</param>
+/// <param name="servicio">Servicio simulado del CEDIS.</param>
+/// <param name="ct">Token compartido para aplicar el timeout de HU-07.</param>
+/// <returns>EAN, existencias o el motivo por el que no se obtuvieron.</returns>
+static async Task<(string Ean, int? Existencia, string? Error)>
+    ConsultarCedisSeguroAsync(
+        string ean,
+        CedisSimulado servicio,
+        CancellationToken ct)
+{
+    try
+    {
+        int existencia = await servicio.ExistenciaAsync(ean, ct);
+        return (ean, existencia, null);
+    }
+    catch (OperationCanceledException) when (ct.IsCancellationRequested)
+    {
+        // El servicio recibió el token; esta respuesta indica que se alcanzó el límite.
+        return (ean, null, "timeout de 3 segundos");
+    }
+    catch (Exception excepcion)
+    {
+        // Un fallo individual se informa sin impedir que el cierre continúe.
+        return (ean, null, excepcion.Message);
+    }
+}
+
+
 Pendiente("HU-08 Pedido sugerido, top de ventas y corte de caja en CSV");
 
 static void Pendiente(string historia) => Console.WriteLine($"[pendiente] {historia}");

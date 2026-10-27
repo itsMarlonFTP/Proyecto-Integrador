@@ -202,6 +202,197 @@ Console.WriteLine();
 
 // Avance 2 (10:15–11:15)
 Pendiente("HU-03 Aplicar la promoción vigente de cada producto");
+
+// HU-03: convierte promociones.csv en reglas del dominio asociadas por EAN.
+var promocionesPorEan = new Dictionary<string, List<Promocion>>(
+    StringComparer.Ordinal);
+
+var rechazosPromociones = new List<string>();
+
+foreach (FilaCsv fila in filasPromociones)
+{
+    string[] campos = fila.Campos;
+
+    if (campos.Length != 3)
+    {
+        rechazosPromociones.Add(
+            $"Línea {fila.Linea}: se esperaban 3 columnas y se encontraron {campos.Length}.");
+        continue;
+    }
+
+    string tipo = campos[0].ToUpperInvariant();
+    string ean = campos[1];
+    string[] parametros = campos[2].Split(';', StringSplitOptions.TrimEntries);
+
+    if (string.IsNullOrWhiteSpace(ean))
+    {
+        rechazosPromociones.Add($"Línea {fila.Linea}: el EAN está vacío.");
+        continue;
+    }
+
+    // Una promoción solo se puede asociar a un producto ya cargado.
+    if (!eansCatalogo.Contains(ean))
+    {
+        rechazosPromociones.Add(
+            $"Línea {fila.Linea}: el EAN '{ean}' no existe en el catálogo.");
+        continue;
+    }
+
+    try
+    {
+        Promocion promocion;
+
+        // Se convierten los parámetros según el tipo especificado en el CSV.
+        switch (tipo)
+        {
+            case "NXM":
+                if (parametros.Length != 2 ||
+                    !int.TryParse(
+                        parametros[0],
+                        NumberStyles.Integer,
+                        CultureInfo.InvariantCulture,
+                        out int lleva) ||
+                    !int.TryParse(
+                        parametros[1],
+                        NumberStyles.Integer,
+                        CultureInfo.InvariantCulture,
+                        out int paga))
+                {
+                    throw new FormatException(
+                        "NXM requiere dos enteros separados por punto y coma.");
+                }
+
+                promocion = new LlevaNPagaM(ean, lleva, paga);
+                break;
+
+            case "PORCENTAJE":
+                if (parametros.Length != 1 ||
+                    !decimal.TryParse(
+                        parametros[0],
+                        NumberStyles.Number,
+                        CultureInfo.InvariantCulture,
+                        out decimal porcentaje))
+                {
+                    throw new FormatException(
+                        "PORCENTAJE requiere un valor numérico.");
+                }
+
+                promocion = new PorcentajeDesc(ean, porcentaje);
+                break;
+
+            case "VOLUMEN":
+                if (parametros.Length != 2 ||
+                    !int.TryParse(
+                        parametros[0],
+                        NumberStyles.Integer,
+                        CultureInfo.InvariantCulture,
+                        out int desdePiezas) ||
+                    !decimal.TryParse(
+                        parametros[1],
+                        NumberStyles.Number,
+                        CultureInfo.InvariantCulture,
+                        out decimal precioEspecial))
+                {
+                    throw new FormatException(
+                        "VOLUMEN requiere una cantidad entera y un precio, separados por punto y coma.");
+                }
+
+                promocion = new PrecioPorVolumen(
+                    ean,
+                    desdePiezas,
+                    precioEspecial);
+                break;
+
+            default:
+                throw new FormatException(
+                    $"El tipo de promoción '{campos[0]}' no es reconocido.");
+        }
+
+        // Se permiten varias reglas por EAN; luego se elegirá la de mayor descuento.
+        if (!promocionesPorEan.TryGetValue(ean, out List<Promocion>? lista))
+        {
+            lista = [];
+            promocionesPorEan.Add(ean, lista);
+        }
+
+        lista.Add(promocion);
+    }
+    catch (ArgumentException excepcion)
+    {
+        rechazosPromociones.Add(
+            $"Línea {fila.Linea}: {excepcion.Message}");
+    }
+    catch (FormatException excepcion)
+    {
+        rechazosPromociones.Add(
+            $"Línea {fila.Linea}: {excepcion.Message}");
+    }
+}
+
+// Calcula el precio bruto, el descuento y el total por cada línea de venta válida.
+var ventasConPromocion =
+    new List<(LineaVenta Venta, decimal Bruto, decimal Descuento,
+              decimal Total, string? PromocionAplicada)>();
+
+var productosPorEan = productos.ToDictionary(
+    producto => producto.Ean,
+    StringComparer.Ordinal);
+
+foreach (LineaVenta venta in ventasValidas)
+{
+    Producto producto = productosPorEan[venta.Ean];
+    decimal bruto = producto.Precio * venta.Piezas;
+
+    Promocion? mejorPromocion = null;
+    decimal descuento = 0m;
+
+    if (promocionesPorEan.TryGetValue(
+            venta.Ean,
+            out List<Promocion>? promocionesProducto))
+    {
+        // No se acumulan promociones: se aplica la que ofrece el mayor ahorro.
+        mejorPromocion = promocionesProducto
+            .Where(promocion => promocion.Aplica(venta.Piezas))
+            .MaxBy(promocion =>
+                promocion.Descuento(producto.Precio, venta.Piezas));
+
+        if (mejorPromocion is not null)
+        {
+            descuento = mejorPromocion.Descuento(
+                producto.Precio,
+                venta.Piezas);
+        }
+    }
+
+    decimal total = bruto - descuento;
+
+    ventasConPromocion.Add((
+        venta,
+        bruto,
+        descuento,
+        total,
+        mejorPromocion?.Nombre));
+
+    Console.WriteLine(
+        $"{venta.Folio} | {producto.Descripcion} | " +
+        $"{venta.Piezas} x {producto.Precio:C2} | " +
+        $"Descuento: {descuento:C2} | Total: {total:C2}" +
+        (mejorPromocion is null
+            ? " | Sin promoción"
+            : $" | {mejorPromocion.Nombre}"));
+}
+
+Console.WriteLine($"Promociones cargadas: {promocionesPorEan.Values.Sum(lista => lista.Count)}");
+Console.WriteLine($"Promociones rechazadas: {rechazosPromociones.Count}");
+
+foreach (string rechazo in rechazosPromociones)
+{
+    Console.WriteLine(rechazo);
+}
+
+Console.WriteLine();
+
+
 Pendiente("HU-04 Validar el pago según su medio: efectivo, tarjeta o vales");
 Pendiente("HU-05 No vender alcohol fuera de horario ni productos bloqueados");
 Pendiente("HU-06 Descontar inventario y avisar si no hay stock suficiente");
